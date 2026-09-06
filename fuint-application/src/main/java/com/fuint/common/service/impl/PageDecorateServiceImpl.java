@@ -131,10 +131,15 @@ public class PageDecorateServiceImpl extends ServiceImpl<MtPageMapper, MtPage> i
      */
     @Override
     public PageDecorationDto getDefaultPage(Integer merchantId, Integer storeId, String pageType) {
-        // 优先取指定店铺，其次取商户级（storeId=0）
+        // 1. 优先取指定店铺
         PageDecorationDto pageDto = getDefaultPageByStore(merchantId, storeId, pageType);
+        // 2. 其次取商户级默认页（storeId=0）
         if (pageDto == null && storeId != null && storeId > 0) {
             pageDto = getDefaultPageByStore(merchantId, 0, pageType);
+        }
+        // 3. 仍无数据时去掉 storeId 条件，按商户维度兜底查询
+        if (pageDto == null && merchantId != null && merchantId > 0) {
+            pageDto = getDefaultPageByMerchant(merchantId, pageType);
         }
         return pageDto;
     }
@@ -151,6 +156,27 @@ public class PageDecorateServiceImpl extends ServiceImpl<MtPageMapper, MtPage> i
         if (merchantId != null && merchantId > 0) {
             lambdaQueryWrapper.eq(MtPage::getMerchantId, merchantId);
         }
+        lambdaQueryWrapper.orderByDesc(MtPage::getUpdateTime);
+        lambdaQueryWrapper.last("limit 1");
+        MtPage mtPage = mtPageMapper.selectOne(lambdaQueryWrapper);
+        if (mtPage == null) {
+            return null;
+        }
+        return buildDecorationDto(mtPage);
+    }
+
+    /**
+     * 按商户查询默认装修页面（不限定店铺，取最新一条）
+     */
+    private PageDecorationDto getDefaultPageByMerchant(Integer merchantId, String pageType) {
+        LambdaQueryWrapper<MtPage> lambdaQueryWrapper = Wrappers.lambdaQuery();
+        lambdaQueryWrapper.eq(MtPage::getStatus, StatusEnum.ENABLED.getKey());
+        lambdaQueryWrapper.eq(MtPage::getPageType, StringUtil.isBlank(pageType) ? "index" : pageType);
+        lambdaQueryWrapper.eq(MtPage::getIsDefault, YesOrNoEnum.YES.getKey());
+        if (merchantId != null && merchantId > 0) {
+            lambdaQueryWrapper.eq(MtPage::getMerchantId, merchantId);
+        }
+        lambdaQueryWrapper.orderByDesc(MtPage::getUpdateTime);
         lambdaQueryWrapper.last("limit 1");
         MtPage mtPage = mtPageMapper.selectOne(lambdaQueryWrapper);
         if (mtPage == null) {
@@ -206,7 +232,11 @@ public class PageDecorateServiceImpl extends ServiceImpl<MtPageMapper, MtPage> i
         mtPage.setUpdateTime(new Date());
 
         if (pageDto.getId() != null && pageDto.getId() > 0) {
-            // 更新
+            // 更新：编辑器勾选“设为默认”时同步默认标记
+            if (YesOrNoEnum.YES.getKey().equals(pageDto.getIsDefault())) {
+                clearDefault(mtPage.getMerchantId(), mtPage.getStoreId(), mtPage.getPageType());
+                mtPage.setIsDefault(YesOrNoEnum.YES.getKey());
+            }
             mtPageMapper.updateById(mtPage);
         } else {
             // 新增
@@ -260,6 +290,31 @@ public class PageDecorateServiceImpl extends ServiceImpl<MtPageMapper, MtPage> i
         }
         clearDefault(mtPage.getMerchantId(), mtPage.getStoreId(), mtPage.getPageType());
         mtPage.setIsDefault(YesOrNoEnum.YES.getKey());
+        // 默认页面必须处于启用状态，否则小程序端读取不到装修配置
+        mtPage.setStatus(StatusEnum.ENABLED.getKey());
+        mtPage.setUpdateTime(new Date());
+        mtPageMapper.updateById(mtPage);
+        return true;
+    }
+
+    /**
+     * 启用/停用装修页面
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean switchStatus(Integer id, String status, AccountInfo accountInfo) throws BusinessCheckException {
+        if (!StatusEnum.ENABLED.getKey().equals(status) && !StatusEnum.FORBIDDEN.getKey().equals(status)) {
+            throw new BusinessCheckException("状态值不正确，仅支持 A（启用）/N（停用）");
+        }
+        MtPage mtPage = queryPageById(id);
+        if (mtPage == null) {
+            throw new BusinessCheckException("数据不存在");
+        }
+        if (accountInfo != null && accountInfo.getMerchantId() != null && accountInfo.getMerchantId() > 0
+                && !mtPage.getMerchantId().equals(accountInfo.getMerchantId())) {
+            throw new BusinessCheckException("不同商户，无权限操作");
+        }
+        mtPage.setStatus(status);
         mtPage.setUpdateTime(new Date());
         mtPageMapper.updateById(mtPage);
         return true;
